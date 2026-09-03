@@ -1866,7 +1866,13 @@ function sizeCanvas() {
   const nw = Math.max(2, Math.round(w * dpr)), nh = Math.max(2, Math.round(h * dpr));
   if (canvas.width !== nw || canvas.height !== nh) { canvas.width = nw; canvas.height = nh; }
 }
-window.addEventListener('resize', () => { sizeCanvas(); if (state.D) drawFrame(state.idx); rerenderCharts(); });
+let resizeTimer = 0;
+window.addEventListener('resize', () => {
+  sizeCanvas();
+  if (state.D) drawFrame(state.idx);
+  clearTimeout(resizeTimer);                     // charts are rebuilt, not reflowed
+  resizeTimer = setTimeout(rerenderCharts, 180);
+});
 
 /* ------------------------------ step 1 ---------------------------- */
 const drop = $('drop');
