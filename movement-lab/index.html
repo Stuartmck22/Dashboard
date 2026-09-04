@@ -1151,6 +1151,7 @@ const PRESETS = {
     family: 'strike',
     strikeName: 'strike',
     overheadOnly: false,
+    armLed: true,                    // a blocked volley legitimately leads with the arm
     trail: 'wristDom',
     blurb: 'Contact is taken as the fastest point of the hitting hand.',
   },
@@ -2240,11 +2241,24 @@ function renderMetrics() {
         'Film side-on and the sequence becomes readable.';
     } else {
       const good = state.R.ordered;
-      $('chainVerdict').innerHTML =
-        `<span class="pill ${good ? 'good' : 'warn'}">${good ? 'Proximal to distal' : 'Out of sequence'}</span> ` +
-        (good
-          ? 'Each segment peaked after the one below it — the pattern you want in a throw or a strike.'
-          : 'One or more segments peaked out of order. On a clean overhead the pelvis leads, then the trunk, then the upper arm, then the forearm. Check the clip is trimmed to a single rep before reading too much into it.');
+      const preset = PRESETS[state.D.opts.preset] || PRESETS.generic;
+      if (good) {
+        $('chainVerdict').innerHTML =
+          '<span class="pill good">Proximal to distal</span> ' +
+          'Each segment peaked after the one below it — the pattern you want in a throw or a full swing.';
+      } else if (preset.armLed) {
+        // Not a fault: you cannot drive a reflex volley from the ground up.
+        $('chainVerdict').innerHTML =
+          '<span class="pill">Arm-led</span> ' +
+          'The arm peaked before the body did. On a blocked or compact volley that is normal — there is no time to ' +
+          'build from the ground. Proximal to distal is what you look for on a full swing: a drive, a serve or an ' +
+          'overhead. Read this chart as a description of how the shot was produced, not a mark out of ten.';
+      } else {
+        $('chainVerdict').innerHTML =
+          '<span class="pill warn">Out of sequence</span> ' +
+          'One or more segments peaked out of order. On a clean overhead the pelvis leads, then the trunk, then the ' +
+          'upper arm, then the forearm. Check the clip is trimmed to a single rep before reading too much into it.';
+      }
     }
   } else {
     chainCard.hidden = true;
