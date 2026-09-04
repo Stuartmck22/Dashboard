@@ -252,6 +252,13 @@ details.more .body { padding: 0 16px 16px; }
 .pill.warn { color: var(--text-primary); border-color: color-mix(in srgb, var(--warning) 55%, transparent); background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .pill.bad  { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, transparent); }
 .stack { display: flex; flex-direction: column; gap: 16px; }
+.warnbar {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 11px 16px; font-size: 12.5px; line-height: 1.55; color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+.warnbar b { color: var(--text-primary); font-weight: 600; }
 .muted { color: var(--text-muted); }
 .err {
   border-left: 3px solid var(--critical); background: color-mix(in srgb, var(--critical) 7%, var(--surface-1));
@@ -394,6 +401,7 @@ kbd {
         <h2>Tracked movement<span class="spacer"></span>
           <span class="pill" id="coveragePill"></span>
         </h2>
+        <div id="occlusionNote" hidden></div>
         <div class="body">
           <div id="resultStage" class="stage-host"></div>
 
@@ -558,7 +566,7 @@ const modelUrl = (k) =>
 const localModelUrl = (k) => `./models/${MODEL_URLS[k]}.task`;
 
 const MAX_SAMPLES = 3000;          // hard ceiling on analysed frames
-const GAP_FILL_MAX = 6;            // frames of missing pose we will bridge
+const GAP_FILL_SECONDS = 0.25;     // how long an occlusion we are willing to bridge
 const MIN_VISIBILITY = 0.35;       // below this a landmark counts as unseen
 
 /** MediaPipe Pose landmark indices we care about. */
@@ -634,6 +642,24 @@ function unwrapDeg(series) {
   return out;
 }
 
+/**
+ * Flags samples sitting inside a NaN run longer than maxRun. They get filled
+ * for the filter's benefit and dropped again afterwards, so an occluded limb
+ * leaves a hole in the output instead of a plausible-looking invention.
+ */
+function longGapMask(series, maxRun) {
+  const n = series.length, mask = new Uint8Array(n);
+  let i = 0;
+  while (i < n) {
+    if (isNum(series[i])) { i++; continue; }
+    let j = i;
+    while (j < n && !isNum(series[j])) j++;
+    if (j - i > maxRun) mask.fill(1, i, j);
+    i = j;
+  }
+  return mask;
+}
+
 /** Bridge NaN runs by linear interpolation; ends are held flat. */
 function fillGaps(series, maxRun = Infinity) {
   const a = Float64Array.from(series);
@@ -687,7 +713,12 @@ function reverse(a) {
   return r;
 }
 function lowpass(series, fc, fs) {
-  const x = Float64Array.from(series);
+  let x = Float64Array.from(series);
+  // A single NaN poisons the recursion and never washes out; filtfilt then
+  // spreads it over the entire series. Fill first, always.
+  for (let i = 0; i < x.length; i++) {
+    if (!isNum(x[i])) { x = fillGaps(x); break; }
+  }
   if (x.length < 5 || !(fc > 0) || fc >= fs * 0.45) return x;
   const c = biquadCoeffs(fc, fs);
   return reverse(biquadPass(reverse(biquadPass(x, c)), c));
@@ -1003,23 +1034,40 @@ function reconstruct(raw, opts) {
 
   /* --- 4. gap fill, then zero-phase low pass, channel by channel --- */
   const fc = clamp(fps * 0.15 * (opts.smoothing ?? 1), 3, 15);
-  const smoothStack = (stack, width) => {
+  const gapLimit = Math.max(3, Math.round(GAP_FILL_SECONDS * fps));
+  const smoothStack = (stack, width, maskLongGaps) => {
     const out = Array.from({ length: n }, () => new Float64Array(width));
     const chan = new Float64Array(n);
     for (let c = 0; c < width; c++) {
       for (let i = 0; i < n; i++) chan[i] = stack[i][c];
-      const filled = fillGaps(chan, GAP_FILL_MAX);
-      const smoothed = lowpass(filled, fc, fps);
-      for (let i = 0; i < n; i++) out[i][c] = smoothed[i];
+      const holes = maskLongGaps ? longGapMask(chan, gapLimit) : null;
+      const smoothed = lowpass(fillGaps(chan), fc, fps);
+      for (let i = 0; i < n; i++) out[i][c] = holes && holes[i] ? NaN : smoothed[i];
     }
     return out;
   };
-  const P = smoothStack(rawPos, N_LM * 3);
-  const draw = smoothStack(rawDraw, N_LM * 2);
+  // Analysis drops what it could not see; the overlay keeps the interpolation
+  // and relies on the per-landmark visibility gate to hide untrustworthy bones.
+  const P = smoothStack(rawPos, N_LM * 3, true);
+  const draw = smoothStack(rawDraw, N_LM * 2, false);
 
   let seen = 0;
   for (let i = 0; i < n; i++) seen += ok[i];
   const coverage = n ? seen / n : 0;
+
+  // "A pose was found" is not the same as "the joint you care about was visible".
+  const landmarkCoverage = (j) => {
+    let c = 0;
+    for (let i = 0; i < n; i++) if ((vis[i]?.[j] ?? 0) >= MIN_VISIBILITY) c++;
+    return n ? c / n : 0;
+  };
+  const keyCoverage = {
+    'hitting hand': landmarkCoverage(LM['wrist' + S]),
+    'hitting elbow': landmarkCoverage(LM['elbow' + S]),
+    'hips': Math.min(landmarkCoverage(LM.hipL), landmarkCoverage(LM.hipR)),
+    'knees': Math.min(landmarkCoverage(LM.kneeL), landmarkCoverage(LM.kneeR)),
+    'feet': Math.min(landmarkCoverage(LM.footL), landmarkCoverage(LM.footR)),
+  };
 
   /* --- 5. angles --------------------------------------------------- */
   const A = {};
@@ -1076,8 +1124,8 @@ function reconstruct(raw, opts) {
     headTop: axisSeries(P, LM.nose, 1),
   };
 
-  return { n, t, dt, fps, ok, vis, coverage, mpp, worldScale, P, draw, A, V, Y, S, O,
-           videoW, videoH, opts, fc };
+  return { n, t, dt, fps, ok, vis, coverage, keyCoverage, gapLimit, mpp, worldScale,
+           P, draw, A, V, Y, S, O, videoW, videoH, opts, fc };
 }
 
 /* ================================================================== *
@@ -1230,13 +1278,17 @@ function analyseStrike(D, preset) {
     const i = argMax(c.series, chainWindow[0], chainWindow[1]);
     return {
       key: c.key, label: c.label, index: i,
+      // A maximum sitting on the window edge is usually the real peak falling
+      // outside it — reporting that as "when the segment fired" is a fiction.
+      clipped: i >= 0 && (i <= chainWindow[0] || i >= chainWindow[1]),
       time: i >= 0 ? D.t[i] - D.t[0] : NaN,
       relMs: (i >= 0 && contact >= 0) ? (i - contact) * dt * 1000 : NaN,
       peak: valueAt(c.series, i),
     };
   });
-  const ordered = chainRows.every((r, k) => k === 0 || !isNum(r.index) || r.index < 0 ||
-    chainRows[k - 1].index < 0 || r.index >= chainRows[k - 1].index);
+  const usable = chainRows.filter((r) => r.index >= 0 && !r.clipped);
+  const ordered = usable.length >= 3 &&
+    usable.every((r, k) => k === 0 || r.index >= usable[k - 1].index);
 
   /* --- metrics --- */
   const peakHandIdx = argMax(V.wristDom);
@@ -2070,6 +2122,7 @@ function showResults() {
   const pill = $('coveragePill');
   pill.textContent = `${pct}% of frames tracked`;
   pill.className = 'pill ' + (pct >= 95 ? 'good' : pct >= 80 ? 'warn' : 'bad');
+  renderOcclusion();
 
   buildTrailOptions();
   renderReferenceState();
@@ -2082,6 +2135,29 @@ function showResults() {
   $('frameSlider').max = String(D.n - 1);
   const primary = R.events.find((e) => e.primary);
   goToFrame(primary ? primary.i : 0);
+}
+
+/**
+ * A pose being found in every frame says nothing about whether the joint you
+ * are reading was visible. Name the ones that spent real time hidden.
+ */
+function renderOcclusion() {
+  const D = state.D;
+  const weak = Object.entries(D.keyCoverage)
+    .filter(([, frac]) => frac < 0.9)
+    .sort((a, b) => a[1] - b[1]);
+  const host = $('occlusionNote');
+  if (!weak.length) { host.hidden = true; host.innerHTML = ''; return; }
+  const worst = weak[0][1];
+  const list = weak.map(([name, frac]) => `${name} ${Math.round(frac * 100)}%`).join(' · ');
+  host.hidden = false;
+  host.className = 'warnbar';
+  host.innerHTML =
+    `<span>⚠</span><span><b>Partly hidden from the camera:</b> ${esc(list)} of frames clearly visible. ` +
+    (worst < 0.6
+      ? 'That is enough to make anything measured at those joints unreliable — reshoot from an angle that keeps them in view.'
+      : 'Angles and speeds at those joints are gappy where the view was blocked; the charts break rather than guess.') +
+    `</span>`;
 }
 
 function buildTrailOptions() {
@@ -2152,8 +2228,16 @@ function renderMetrics() {
     chainCard.hidden = false;
     renderChainChart($('chainChart'), state.D, state.R);
     const rows = state.R.chainRows.filter((r) => isNum(r.relMs));
+    const clipped = state.R.chainRows.filter((r) => r.clipped).map((r) => r.label);
     if (rows.length < 2) {
       $('chainVerdict').innerHTML = 'Not enough of the chain was tracked to judge the sequence.';
+    } else if (clipped.length) {
+      $('chainVerdict').innerHTML =
+        `<span class="pill warn">Can't judge the sequence</span> ` +
+        `${esc(clipped.join(', '))} ${clipped.length > 1 ? 'were' : 'was'} still speeding up at the edge of the ` +
+        'window around contact, so the real peak is outside it. That usually means the camera cannot see the ' +
+        'rotation — a view from behind the athlete flattens the transverse plane these are measured in. ' +
+        'Film side-on and the sequence becomes readable.';
     } else {
       const good = state.R.ordered;
       $('chainVerdict').innerHTML =

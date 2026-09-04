@@ -4,7 +4,7 @@
  */
 const core = await import(process.env.MOVEMENT_LAB_CORE ?? './.core.generated.mjs');
 const { reconstruct, analyse, LM, N_LM, lowpass, derivative, jointAngle,
-        fitQuadratic, fillGaps, unwrapDeg, percentile, longestRun } = core;
+        fitQuadratic, fillGaps, longGapMask, unwrapDeg, percentile, longestRun } = core;
 
 /* ---------------- synthetic camera ---------------- */
 const W = 1280, H = 720, VIEW_H = 2.6, VIEW_W = VIEW_H * W / H;
@@ -110,6 +110,22 @@ console.log('--- primitives ---');
   const u = unwrapDeg([170, 179, -179, -170]);
   near(u[3], 190, 1e-9, 'heading unwrap crosses ±180 cleanly');
 
+  // An IIR filter's state is poisoned by one NaN and never recovers; filtfilt
+  // then smears it over the whole series in both directions. Caught in the wild
+  // on a padel overhead: the racket hand goes behind the head for ~15 frames and
+  // every metric in the clip came back empty.
+  const holed = Float64Array.from(clean);
+  for (let i = 100; i < 130; i++) holed[i] = NaN;
+  const filtered = lowpass(holed, 8, fs);
+  let finite = 0;
+  for (const v of filtered) if (Number.isFinite(v)) finite++;
+  near(finite, n, 0, 'a NaN run cannot poison the whole filtered series');
+
+  const mask = longGapMask(holed, 10);
+  near(mask[115], 1, 0, 'long gap is flagged');
+  near(mask[50], 0, 0, 'good samples are not flagged');
+  near(longGapMask(holed, 40)[115], 0, 0, 'a gap within the limit is trusted');
+
   const g = fillGaps([1, NaN, NaN, 4], 5);
   near(g[1], 2, 1e-9, 'gap fill interpolates');
   near(g[2], 3, 1e-9, 'gap fill interpolates');
@@ -172,6 +188,53 @@ console.log('\n--- synthetic countermovement jump ---');
   near(ev.takeoff, T_TAKEOFF, 0.05, 'take-off frame');
   near(ev.landing, T_LAND, 0.05, 'landing frame');
   assert(R.phases.map(p => p.label).includes('Flight'), 'flight phase labelled');
+}
+
+/* ------- test 2b: the same jump with a limb occluded mid-flight ------- */
+console.log('\n--- occlusion tolerance (regression) ---');
+{
+  const fps = 60, dur = 1.7, n = Math.round(dur*fps);
+  const V0 = 2.5, G = 9.81;
+  const T_TAKEOFF = 0.70, FLIGHT = 2*V0/G, T_LAND = T_TAKEOFF + FLIGHT;
+  const STAND_HIP = 0.94, DIP_HIP = 0.66, TOE = 0.02;
+  const ease = (a, b, u) => a + (b-a)*(1 - Math.cos(Math.PI*Math.min(1,Math.max(0,u))))/2;
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i/fps;
+    let hipY, toeY = TOE;
+    if (t < 0.30)      hipY = STAND_HIP;
+    else if (t < 0.55) hipY = ease(STAND_HIP, DIP_HIP, (t-0.30)/0.25);
+    else if (t < T_TAKEOFF) hipY = ease(DIP_HIP, 1.00, (t-0.55)/(T_TAKEOFF-0.55));
+    else if (t < T_LAND) {
+      const s2 = V0*(t-T_TAKEOFF) - 0.5*G*(t-T_TAKEOFF)**2;
+      toeY = TOE + s2; hipY = toeY + 0.88;
+    } else {
+      const u = (t - T_LAND)/0.25;
+      hipY = u < 0.5 ? ease(0.98, 0.72, u*2) : ease(0.72, 0.92, (u-0.5)*2);
+    }
+    frames.push(makePose({ hipY, toeY }));
+  }
+  const raw = buildRaw(frames, fps);
+  // hide the right wrist for 18 frames — longer than the old 6-frame bridge
+  for (let i = 40; i < 58; i++) {
+    raw.vis[i][LM.wristR] = 0.1;
+    for (let k = 0; k < 3; k++) { raw.normed[i][LM.wristR*3+k] = NaN; raw.world[i][LM.wristR*3+k] = NaN; }
+  }
+  const D = reconstruct(raw, { preset: 'jump', side: 'right', smoothing: 1, heightCm: 0 });
+  const R = analyse(D);
+  D.events = R.events; D.phases = R.phases;
+  const m = (k) => R.metrics.find(x => x.key === k)?.value;
+
+  near(m('jump_height_flight'), G*FLIGHT*FLIGHT/8*100, 3.5, 'jump height survives an occluded wrist');
+  near(m('countermovement_depth'), (STAND_HIP-DIP_HIP)*100, 3, 'depth survives an occluded wrist');
+  let kneeFinite = 0;
+  for (const v of D.A.kneeR) if (Number.isFinite(v)) kneeFinite++;
+  assert(kneeFinite === D.n, 'an occluded wrist does not blank unrelated joints');
+  let wristFinite = 0;
+  for (const v of D.V.wristDom) if (Number.isFinite(v)) wristFinite++;
+  assert(wristFinite > D.n * 0.6 && wristFinite < D.n,
+    `the occluded window is dropped, the rest kept (${wristFinite}/${D.n} samples)`);
+  near(D.keyCoverage['hitting hand'], (D.n - 18) / D.n, 0.02, 'occlusion is reported to the user');
 }
 
 /* ---------------- test 3: proximal-to-distal sequencing ---------------- */

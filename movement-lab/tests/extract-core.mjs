@@ -10,8 +10,9 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const MARKER = ' * Overlay — the skeleton, trails and ghosts drawn over the video';
 const EXPORTS = `
-export { lowpass, derivative, jointAngle, unwrapDeg, fillGaps, fitQuadratic, percentile,
-         longestRun, reconstruct, analyse, PRESETS, LM, N_LM, argMax, argMin, median, ticks };
+export { lowpass, derivative, jointAngle, unwrapDeg, fillGaps, longGapMask, fitQuadratic,
+         percentile, longestRun, reconstruct, analyse, PRESETS, LM, N_LM, argMax, argMin,
+         median, ticks };
 `;
 
 export async function buildCore() {
