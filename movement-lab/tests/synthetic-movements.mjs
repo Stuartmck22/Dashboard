@@ -278,5 +278,50 @@ console.log('\n--- synthetic overhead strike ---');
   assert(Number.isFinite(m('max_separation')), 'shoulder–hip separation computed');
 }
 
+/* -------- test 4: ambiguous contact, and the coach's override -------- */
+console.log('\n--- contact ambiguity and pinning (regression) ---');
+{
+  // Shape taken from a real padel forehand: the racket drop produces a hand-speed
+  // peak of its own, ~180 ms before the strike, and pose alone cannot tell them
+  // apart. The app must flag it rather than silently pick the taller one.
+  const fps = 60, dur = 1.6, n = Math.round(dur*fps);
+  const bump = (t, c, w, h) => h * Math.exp(-(((t - c) / w) ** 2));
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i/fps;
+    // arm sweeps twice: a drop at 0.55 s and the strike at 0.75 s
+    const armPhi  = 150 - 55*(1/(1+Math.exp(-(t-0.55)/0.026))) - 58*(1/(1+Math.exp(-(t-0.75)/0.030)));
+    const forePhi = 165 - 62*(1/(1+Math.exp(-(t-0.55)/0.025))) - 66*(1/(1+Math.exp(-(t-0.75)/0.028)));
+    const hipY = 0.92 - bump(t, 0.6, 0.25, 0.06);
+    frames.push(makePose({ hipY, toeY: 0.02, pelvisDeg: -10 + 20*(1/(1+Math.exp(-(t-0.7)/0.05))),
+                           trunkDeg: -14 + 28*(1/(1+Math.exp(-(t-0.72)/0.05))), armPhi, forePhi }));
+  }
+  const raw = buildRaw(frames, fps);
+  const base = { preset: 'volley', side: 'right', smoothing: 1, heightCm: 0 };
+
+  const D1 = reconstruct(raw, base);
+  const R1 = analyse(D1);
+  const pk = [...D1.V.wristDom].map((v,i)=>[D1.t[i],v]).filter(([t])=>t>0.4&&t<0.95);
+  const top = Math.max(...pk.map(p=>p[1]));
+  console.log('   peak hand speed', top.toFixed(2), 'm/s; trace:',
+    pk.filter((_,k)=>k%4===0).map(([t,v])=>`${t.toFixed(2)}:${v.toFixed(1)}`).join(' '));
+  console.log('   candidate peaks at:',
+    R1.candidates.map(i => (D1.t[i]).toFixed(3) + 's').join(', ') || '(none)');
+  assert(R1.candidates.length >= 2, 'a two-peak swing is flagged as ambiguous');
+  assert(R1.pinned === false, 'nothing is pinned until the user pins it');
+
+  // the coach scrubs to the real strike and pins it
+  const pin = Math.round(0.78 * fps);
+  const D2 = reconstruct(raw, { ...base, contactPin: pin });
+  const R2 = analyse(D2);
+  assert(R2.contact === pin, 'pinned frame becomes contact');
+  assert(R2.pinned === true, 'the pin is reported so the UI can say so');
+  const at = (R) => R.metrics.find(m => m.key === 'hand_speed_at_contact')?.value;
+  assert(Number.isFinite(at(R2)) && at(R2) !== at(R1),
+    'contact-relative metrics are recomputed from the pinned frame');
+  const ev = R2.events.find(e => e.primary);
+  near(D2.t[ev.i], pin / fps, 1e-9, 'the Contact marker moves to the pinned frame');
+}
+
 console.log(`\n${fails === 0 ? 'ALL TESTS PASSED' : fails + ' FAILURE(S)'}`);
 process.exit(fails ? 1 : 0);
