@@ -4,7 +4,8 @@
  */
 const core = await import(process.env.MOVEMENT_LAB_CORE ?? './.core.generated.mjs');
 const { reconstruct, analyse, LM, N_LM, lowpass, derivative, jointAngle,
-        fitQuadratic, fillGaps, longGapMask, unwrapDeg, percentile, longestRun } = core;
+        fitQuadratic, fillGaps, longGapMask, unwrapDeg, percentile, longestRun,
+        argMax, argMin } = core;
 
 /* ---------------- synthetic camera ---------------- */
 const W = 1280, H = 720, VIEW_H = 2.6, VIEW_W = VIEW_H * W / H;
@@ -321,6 +322,46 @@ console.log('\n--- contact ambiguity and pinning (regression) ---');
     'contact-relative metrics are recomputed from the pinned frame');
   const ev = R2.events.find(e => e.primary);
   near(D2.t[ev.i], pin / fps, 1e-9, 'the Contact marker moves to the pinned frame');
+}
+
+/* ---- test 5: an overhead is struck at reach, not at top hand speed ---- */
+console.log('\n--- overhead contact taken at maximum reach (regression) ---');
+{
+  // From a real padel jumping smash: the arm whips up into the trophy position
+  // faster (11.2 m/s) than it comes through the ball (9.7 m/s), but the strike
+  // is 13 cm higher. Picking the quicker moment dated contact 200 ms early.
+  const fps = 60, dur = 1.5, n = Math.round(dur*fps);
+  const sig = (t, c, w) => 1/(1 + Math.exp(-(t-c)/w));
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i/fps;
+    // a fast reach up at 0.45 s, then the true strike at 0.80 s from higher up
+    const armPhi  = 122 - 85*sig(t, 0.45, 0.024) + 45*sig(t, 0.62, 0.045) - 50*sig(t, 0.80, 0.017);
+    const forePhi = 132 - 92*sig(t, 0.45, 0.023) + 48*sig(t, 0.62, 0.042) - 56*sig(t, 0.80, 0.016);
+    const hipY = 0.94 + 0.16*Math.exp(-(((t-0.82)/0.16)**2));   // he leaves the ground for the strike
+    frames.push(makePose({ hipY, toeY: 0.02 + 0.16*Math.exp(-(((t-0.82)/0.16)**2)),
+                           pelvisDeg: -12 + 24*sig(t, 0.74, 0.05),
+                           trunkDeg: -18 + 36*sig(t, 0.76, 0.05), armPhi, forePhi }));
+  }
+  const raw = buildRaw(frames, fps);
+  const D = reconstruct(raw, { preset: 'smash', side: 'right', smoothing: 1, heightCm: 0 });
+  const R = analyse(D);
+  D.events = R.events; D.phases = R.phases;
+
+  const wristY = D.P.map(p => p[16*3 + 1]);
+  const spd = D.V.wristDom;
+  const cands = R.candidates.length ? R.candidates : [R.contact];
+  console.log('   candidates:', cands.map(i =>
+    `${D.t[i].toFixed(2)}s spd=${spd[i].toFixed(1)} y=${wristY[i].toFixed(2)}`).join('  '));
+  console.log(`   contact chosen at ${D.t[R.contact].toFixed(3)}s`);
+
+  const fastest = argMax(spd);
+  const highestCand = cands.reduce((b, i) => (wristY[i] > wristY[b] ? i : b), cands[0]);
+  assert(cands.length >= 2, 'the reach and the strike are both candidates');
+  assert(wristY[R.contact] >= wristY[fastest] - 1e-9,
+    'contact is not below the fastest-hand moment');
+  assert(R.contact === highestCand, 'contact is the highest candidate, not the quickest');
+  assert(D.t[R.contact] > 0.6, `contact falls in the strike, not the reach (${D.t[R.contact].toFixed(2)}s)`);
 }
 
 console.log(`\n${fails === 0 ? 'ALL TESTS PASSED' : fails + ' FAILURE(S)'}`);

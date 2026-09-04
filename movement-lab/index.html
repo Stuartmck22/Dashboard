@@ -1070,6 +1070,8 @@ function reconstruct(raw, opts) {
     for (let i = 0; i < n; i++) if ((vis[i]?.[j] ?? 0) >= MIN_VISIBILITY) c++;
     return n ? c / n : 0;
   };
+  const lmCoverage = new Float64Array(N_LM);
+  for (let j = 0; j < N_LM; j++) lmCoverage[j] = landmarkCoverage(j);
   const keyCoverage = {
     'hitting hand': landmarkCoverage(LM['wrist' + S]),
     'hitting elbow': landmarkCoverage(LM['elbow' + S]),
@@ -1133,7 +1135,7 @@ function reconstruct(raw, opts) {
     headTop: axisSeries(P, LM.nose, 1),
   };
 
-  return { n, t, dt, fps, ok, vis, coverage, keyCoverage, gapLimit, mpp, worldScale,
+  return { n, t, dt, fps, ok, vis, coverage, keyCoverage, lmCoverage, gapLimit, mpp, worldScale,
            P, draw, A, V, Y, S, O, videoW, videoH, opts, fc };
 }
 
@@ -1271,7 +1273,14 @@ function analyseStrike(D, preset) {
   let contact = -1;
   if (overhead) {
     const masked = maskSeries(V.wristDom, aboveShoulder);
-    contact = argMax(masked);
+    // An overhead is struck at maximum reach — that is what makes it an
+    // overhead. So among the moments the hand is moving fastest above the
+    // shoulder, take the highest one, not the quickest. The reach into the
+    // trophy position can be faster than the strike itself.
+    const reaches = speedPeaks(masked, dt);
+    contact = reaches.length
+      ? reaches.reduce((best, i) => (Y.wristDom[i] > Y.wristDom[best] ? i : best), reaches[0])
+      : argMax(masked);
   }
   if (contact < 0) contact = argMax(V.wristDom);
 
@@ -1309,15 +1318,23 @@ function analyseStrike(D, preset) {
   /* --- kinetic chain: when did each segment peak? --- */
   const chainWindow = [Math.max(0, deepestKnee), Math.min(n - 1, contact + Math.round(0.05 / dt))];
   const chainDefs = [
-    { key: 'pelvis',   label: 'Pelvis',    series: Float64Array.from(V.pelvisRot, Math.abs) },
-    { key: 'trunk',    label: 'Trunk',     series: Float64Array.from(V.trunkRot, Math.abs) },
-    { key: 'upperArm', label: 'Upper arm', series: V.upperArm },
-    { key: 'forearm',  label: 'Forearm',   series: V.forearm },
+    { key: 'pelvis',   label: 'Pelvis',    series: Float64Array.from(V.pelvisRot, Math.abs),
+      deps: [LM.hipL, LM.hipR] },
+    { key: 'trunk',    label: 'Trunk',     series: Float64Array.from(V.trunkRot, Math.abs),
+      deps: [LM.shoulderL, LM.shoulderR] },
+    { key: 'upperArm', label: 'Upper arm', series: V.upperArm,
+      deps: [LM['shoulder' + S], LM['elbow' + S]] },
+    { key: 'forearm',  label: 'Forearm',   series: V.forearm,
+      deps: [LM['elbow' + S], LM['wrist' + S]] },
   ];
   const chainRows = chainDefs.map((c) => {
     const i = argMax(c.series, chainWindow[0], chainWindow[1]);
+    const seen = Math.min(...c.deps.map((j) => D.lmCoverage[j]));
     return {
-      key: c.key, label: c.label, index: i,
+      key: c.key, label: c.label, index: i, seen,
+      // A segment whose own landmarks spent much of the clip hidden cannot be
+      // timed to tens of milliseconds, so it does not get a vote.
+      unreliable: seen < 0.85,
       // A maximum sitting on the window edge is usually the real peak falling
       // outside it — reporting that as "when the segment fired" is a fiction.
       clipped: i >= 0 && (i <= chainWindow[0] || i >= chainWindow[1]),
@@ -1326,7 +1343,7 @@ function analyseStrike(D, preset) {
       peak: valueAt(c.series, i),
     };
   });
-  const usable = chainRows.filter((r) => r.index >= 0 && !r.clipped);
+  const usable = chainRows.filter((r) => r.index >= 0 && !r.clipped && !r.unreliable);
   const ordered = usable.length >= 3 &&
     usable.every((r, k) => k === 0 || r.index >= usable[k - 1].index);
 
@@ -2305,8 +2322,16 @@ function renderMetrics() {
     renderChainChart($('chainChart'), state.D, state.R);
     const rows = state.R.chainRows.filter((r) => isNum(r.relMs));
     const clipped = state.R.chainRows.filter((r) => r.clipped).map((r) => r.label);
+    const shaky = state.R.chainRows.filter((r) => r.unreliable);
     if (rows.length < 2) {
       $('chainVerdict').innerHTML = 'Not enough of the chain was tracked to judge the sequence.';
+    } else if (shaky.length) {
+      const names = shaky.map((r) => `${r.label.toLowerCase()} (${Math.round(r.seen * 100)}%)`).join(', ');
+      $('chainVerdict').innerHTML =
+        `<span class="pill warn">Can't judge the sequence</span> ` +
+        `The landmarks behind ${esc(names)} were only visible for part of the clip, and a segment you ` +
+        'cannot see cannot be timed to tens of milliseconds. The dots above are still plotted, but do not ' +
+        'read an order into them. A camera angle that keeps the hitting arm in view fixes this.';
     } else if (clipped.length) {
       $('chainVerdict').innerHTML =
         `<span class="pill warn">Can't judge the sequence</span> ` +
