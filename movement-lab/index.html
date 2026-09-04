@@ -2224,11 +2224,16 @@ function renderContactNote() {
     return;
   }
   const times = R.candidates.map((i) => `${(D.t[i] - D.t[0]).toFixed(3)}s`).join(', ');
+  const spread = (R.candidates[R.candidates.length - 1] - R.candidates[0]) * D.dt;
+  // Peaks a second or more apart are separate shots, not one swing read twice.
+  const why = spread > 0.8
+    ? 'That spread is too wide for one swing, so the clip almost certainly holds more than one shot. ' +
+      'Trim to a single rep and analyse again — the phases and the sequencing chart assume one.'
+    : 'Pose alone cannot see which one met the ball: a racket drop looks much like a strike.';
   host.innerHTML =
     `<span>?</span><span><b>Contact timing is a guess here.</b> The hand reached a comparable top speed at ` +
-    `${esc(times)}, and pose alone cannot see which one met the ball — a racket drop looks much like a ` +
-    'strike. Step to the frame where the ball leaves the strings and press <b>Contact is this frame</b> ' +
-    'to correct it.</span>';
+    `${esc(times)}. ${why} You can also step to the frame where the ball leaves the strings and press ` +
+    '<b>Contact is this frame</b>.</span>';
 }
 
 function buildTrailOptions() {
