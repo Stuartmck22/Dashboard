@@ -408,6 +408,7 @@ kbd {
           <span class="pill" id="coveragePill"></span>
         </h2>
         <div id="occlusionNote" hidden></div>
+        <div id="jitterNote" hidden></div>
         <div class="body">
           <div id="resultStage" class="stage-host"></div>
 
@@ -577,6 +578,22 @@ const localModelUrl = (k) => `./models/${MODEL_URLS[k]}.task`;
 const MAX_SAMPLES = 3000;          // hard ceiling on analysed frames
 const GAP_FILL_SECONDS = 0.25;     // how long an occlusion we are willing to bridge
 const MIN_VISIBILITY = 0.35;       // below this a landmark counts as unseen
+
+/**
+ * Ceilings on joint angular velocity, deg/s. Above these the human isn't moving
+ * that fast — the camera is failing to freeze them. A phone at 1/120s shutter
+ * smears a swinging arm into a streak, and the pose model reports the smear
+ * with high confidence, so visibility scores do not catch it. Elite tennis
+ * serves peak near 2,500 deg/s at the elbow; padel overheads sit lower.
+ */
+const RATE_CEILING = { elbow: 2500, shoulder: 2200, knee: 1800, hip: 1800, ankle: 1800 };
+
+/**
+ * Anatomical limits, degrees. A rate ceiling catches a landmark that jumps; it
+ * cannot catch one that sits still in the wrong place. A 20 deg elbow would mean
+ * the forearm folded flat against the biceps, which soft tissue prevents.
+ */
+const ANGLE_RANGE = { elbow: [25, 185], shoulder: [0, 185], knee: [28, 190], hip: [20, 190], ankle: [40, 190] };
 
 /** MediaPipe Pose landmark indices we care about. */
 const LM = {
@@ -951,6 +968,13 @@ function percentile(values, p) {
   return a[clamp(Math.round((a.length - 1) * p), 0, a.length - 1)];
 }
 
+/** Human-readable joint name, saying which arm is the hitting one. */
+function prettyJoint(name, side, dominant) {
+  const which = side === dominant ? 'hitting' : 'other';
+  return name === 'elbow' || name === 'shoulder' ? `${which}-side ${name}`
+       : `${side === 'L' ? 'left' : 'right'} ${name}`;
+}
+
 /** Per-axis series for one landmark out of the filtered position stack. */
 function axisSeries(P, idx, axis) {
   const out = new Float64Array(P.length);
@@ -1110,6 +1134,43 @@ function reconstruct(raw, opts) {
     A.separation[i] = wrapTo180(shHeading[i] - hipHeading[i]);
   }
 
+  /* --- 5b. drop samples the camera could not actually freeze --------- */
+  const jitter = [];
+  const impossible = [];
+  for (const [name, [lo, hi]] of Object.entries(ANGLE_RANGE)) {
+    for (const side of ['L', 'R']) {
+      const series = A[name + side];
+      if (!series) continue;
+      let run = null;
+      for (let i = 0; i < n; i++) {
+        const v = series[i];
+        if (!isNum(v) || (v >= lo && v <= hi)) { run = null; continue; }
+        const extreme = v < lo ? v : v;
+        if (run && i - run.i1 <= 3) { run.i1 = i; run.extreme = v < lo ? Math.min(run.extreme, v) : Math.max(run.extreme, v); }
+        else { run = { label: prettyJoint(name, side, S), i0: i, i1: i, extreme, limit: v < lo ? lo : hi };
+               impossible.push(run); }
+        series[i] = NaN;
+      }
+    }
+  }
+  for (const [name, ceiling] of Object.entries(RATE_CEILING)) {
+    for (const side of ['L', 'R']) {
+      const key = name + side;
+      const series = A[key];
+      if (!series) continue;
+      const rate = derivative(series, dt);
+      let bad = null;
+      for (let i = 0; i < n; i++) {
+        if (!(Math.abs(rate[i]) > ceiling)) continue;
+        for (let k = Math.max(0, i - 1); k <= Math.min(n - 1, i + 1); k++) series[k] = NaN;
+        if (bad && i - bad.i1 <= 3) bad.i1 = i;
+        else { bad = { key, label: prettyJoint(name, side, S), i0: i, i1: i,
+                       peak: Math.abs(rate[i]) }; jitter.push(bad); }
+        bad.peak = Math.max(bad.peak, Math.abs(rate[i]));
+      }
+    }
+  }
+
   /* --- 6. velocities ------------------------------------------------ */
   const V = {};
   V.wristDom   = pointSpeed(P, LM['wrist' + S], dt);
@@ -1135,7 +1196,7 @@ function reconstruct(raw, opts) {
     headTop: axisSeries(P, LM.nose, 1),
   };
 
-  return { n, t, dt, fps, ok, vis, coverage, keyCoverage, lmCoverage, gapLimit, mpp, worldScale,
+  return { n, t, dt, fps, ok, vis, coverage, keyCoverage, lmCoverage, jitter, impossible, gapLimit, mpp, worldScale,
            P, draw, A, V, Y, S, O, videoW, videoH, opts, fc };
 }
 
@@ -2182,6 +2243,7 @@ function showResults() {
   pill.textContent = `${pct}% of frames tracked`;
   pill.className = 'pill ' + (pct >= 95 ? 'good' : pct >= 80 ? 'warn' : 'bad');
   renderOcclusion();
+  renderJitter();
 
   buildTrailOptions();
   renderContactNote();
@@ -2251,6 +2313,43 @@ function renderContactNote() {
     `<span>?</span><span><b>Contact timing is a guess here.</b> The hand reached a comparable top speed at ` +
     `${esc(times)}. ${why} You can also step to the frame where the ball leaves the strings and press ` +
     '<b>Contact is this frame</b>.</span>';
+}
+
+/**
+ * Motion blur is not occlusion: the pose model reports a smeared limb with high
+ * confidence, so the visibility score never dips. What gives it away is the
+ * limb appearing to move faster than a human can.
+ */
+function renderJitter() {
+  const D = state.D;
+  const host = $('jitterNote');
+  const anat = D.impossible || [];
+  if (!D.jitter?.length && !anat.length) { host.hidden = true; host.innerHTML = ''; return; }
+  if (!D.jitter?.length) {
+    const j = anat.reduce((a, b) => (Math.abs(b.extreme - b.limit) > Math.abs(a.extreme - a.limit) ? b : a));
+    host.hidden = false;
+    host.className = 'warnbar';
+    host.innerHTML =
+      `<span>⚠</span><span><b>Tracking put a joint where it cannot go.</b> The ${esc(j.label)} reads ` +
+      `${Math.round(j.extreme)}° at ${(D.t[j.i0] - D.t[0]).toFixed(2)}s, past the anatomical limit of ` +
+      `${j.limit}°, so the limb was mis-placed rather than measured. Those samples are dropped. Usually a ` +
+      'blurred or partly hidden arm — a faster shutter and a clearer view of the hitting side fix it.</span>';
+    return;
+  }
+  const t0 = D.t[0];
+  const worst = D.jitter.reduce((a, b) => (b.peak > a.peak ? b : a));
+  const spans = D.jitter
+    .map((j) => `${(D.t[j.i0] - t0).toFixed(2)}–${(D.t[j.i1] - t0).toFixed(2)}s`)
+    .join(', ');
+  const joints = [...new Set(D.jitter.map((j) => j.label))].join(', ');
+  host.hidden = false;
+  host.className = 'warnbar';
+  host.innerHTML =
+    `<span>⚠</span><span><b>Too fast for the camera to freeze.</b> The ${esc(joints)} appears to move at ` +
+    `${Math.round(worst.peak).toLocaleString()}°/s at ${esc(spans)} — beyond what a human joint does, so the ` +
+    'limb is smeared across those frames rather than actually there. Those samples are dropped: the charts ' +
+    'break and any measurement needing them reads “—”. A faster shutter speed fixes it; more light lets the ' +
+    'camera choose one.</span>';
 }
 
 function buildTrailOptions() {
@@ -2713,6 +2812,8 @@ $('jsonBtn').addEventListener('click', () => {
     movement: D.opts.preset,
     contactPinnedByUser: isNum(D.opts.contactPin) ? D.opts.contactPin : null,
     calibration: { metresPerPixel: D.mpp, worldScale: D.worldScale, filterCutoffHz: D.fc },
+    droppedForMotionBlur: (D.jitter || []).map((j) => ({
+      joint: j.label, from: D.t[j.i0] - D.t[0], to: D.t[j.i1] - D.t[0], apparentRateDegPerS: j.peak })),
     events: R.events.map((e) => ({ key: e.key, label: e.label, frame: e.i, time: D.t[e.i] - D.t[0] })),
     phases: R.phases.map((p) => ({ label: p.label, from: D.t[p.i0] - D.t[0], to: D.t[p.i1] - D.t[0] })),
     sequencing: R.chainRows?.map((r) => ({ segment: r.label, msRelativeToKeyEvent: r.relMs, peak: r.peak })) ?? null,

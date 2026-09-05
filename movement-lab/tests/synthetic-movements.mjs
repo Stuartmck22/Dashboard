@@ -364,5 +364,48 @@ console.log('\n--- overhead contact taken at maximum reach (regression) ---');
   assert(D.t[R.contact] > 0.6, `contact falls in the strike, not the reach (${D.t[R.contact].toFixed(2)}s)`);
 }
 
+/* ------ test 6: motion blur is caught where visibility scores miss it ------ */
+console.log('\n--- motion-blur rejection (regression) ---');
+{
+  // A real padel smash at 60 fps with a slow shutter: the elbow appeared to go
+  // 166 deg -> 102 deg -> 156 deg inside 100 ms, which is ~3,100 deg/s and not a
+  // thing an elbow does. MediaPipe reported it at 0.95 visibility throughout,
+  // so the occlusion check saw nothing wrong.
+  const fps = 60, dur = 1.2, n = Math.round(dur*fps);
+  // The real signature: the arm sits deeply cocked, then the tracker snaps it
+  // straight in two frames — 56 deg to 160 deg, about 3,100 deg/s.
+  const BLUR = [28, 42];
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i/fps;
+    const armPhi = 120 - 40*(1/(1+Math.exp(-(t-0.55)/0.04)));
+    // Through the smeared frames the forearm is placed folded back on itself —
+    // a plausible-looking pose in a wrong position, which is what blur produces.
+    const folded = i >= BLUR[0] && i <= BLUR[1];
+    frames.push(makePose({ hipY: 0.94, toeY: 0.02, armPhi,
+                           forePhi: armPhi + (folded ? 145 : 12) }));
+  }
+  const raw = buildRaw(frames, fps);
+  for (let i = BLUR[0]; i <= BLUR[1]; i++) raw.vis[i][LM.wristR] = 0.95;   // and confident about it
+
+  const D = reconstruct(raw, { preset: 'smash', side: 'right', smoothing: 1, heightCm: 0 });
+
+  { const rate=[]; for(let i=1;i<D.n-1;i++) rate.push(((D.A.elbowR[i+1]-D.A.elbowR[i-1])/(2*D.dt))||0);
+    const mx=Math.max(...rate.map(Math.abs));
+    console.log(`   peak apparent elbow rate ${mx.toFixed(0)} deg/s, jitter windows: ${D.jitter.length}`); }
+  assert(D.jitter.length > 0, 'a physiologically impossible joint rate is caught');
+  assert(D.keyCoverage['hitting hand'] > 0.95,
+    'visibility scores stay high — occlusion checks alone would have missed it');
+  const bad = D.jitter[0];
+  console.log(`   flagged ${bad.label} at ${bad.peak.toFixed(0)} deg/s, frames ${bad.i0}-${bad.i1}`);
+  assert(bad.peak > 2500, `flagged rate is above the ceiling (${bad.peak.toFixed(0)} deg/s)`);
+  let blanked = 0;
+  for (let i = 40; i <= 48; i++) if (!Number.isFinite(D.A.elbowR[i])) blanked++;
+  assert(blanked >= 3, `the smeared samples are dropped, not reported (${blanked} blanked)`);
+  let kept = 0;
+  for (let i = 0; i < 25; i++) if (Number.isFinite(D.A.elbowR[i])) kept++;
+  assert(kept >= 22, `clean samples elsewhere in the clip are untouched (${kept}/25)`);
+}
+
 console.log(`\n${fails === 0 ? 'ALL TESTS PASSED' : fails + ' FAILURE(S)'}`);
 process.exit(fails ? 1 : 0);
