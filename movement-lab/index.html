@@ -595,6 +595,19 @@ const RATE_CEILING = { elbow: 2500, shoulder: 2200, knee: 1800, hip: 1800, ankle
  */
 const ANGLE_RANGE = { elbow: [25, 185], shoulder: [0, 185], knee: [28, 190], hip: [20, 190], ankle: [40, 190] };
 
+/**
+ * Ceilings on whole-segment rotation, deg/s. The shoulder line is only ~40 cm
+ * long, so a small error in one shoulder swings its computed heading a long way
+ * — on a rear-view smash the heading moved 125 deg in 34 ms and back. Elite
+ * pelvis rotation peaks near 700 deg/s and trunk near 1,200.
+ */
+const SEGMENT_RATE_CEILING = {
+  pelvisRot: { limit: 1000, label: 'pelvis rotation' },
+  trunkRot:  { limit: 1400, label: 'trunk rotation' },
+  upperArm:  { limit: 2500, label: 'upper-arm rotation' },
+  forearm:   { limit: 3500, label: 'forearm rotation' },
+};
+
 /** MediaPipe Pose landmark indices we care about. */
 const LM = {
   nose: 0, eyeL: 2, eyeR: 5, earL: 7, earR: 8,
@@ -1185,6 +1198,20 @@ function reconstruct(raw, opts) {
   V.forearm    = segmentAngularSpeed(P, LM['elbow' + S], LM['wrist' + S], dt);
   V.elbowExt   = derivative(A['elbow' + S], dt);
   V.kneeExtDom = derivative(A['knee' + S], dt);
+
+  /* --- 6b. the same reality check on whole-segment rotation ---------- */
+  for (const [key, { limit, label }] of Object.entries(SEGMENT_RATE_CEILING)) {
+    const series = V[key];
+    if (!series) continue;
+    let run = null;
+    for (let i = 0; i < n; i++) {
+      if (!(Math.abs(series[i]) > limit)) continue;
+      const peak = Math.abs(series[i]);
+      if (run && i - run.i1 <= 3) { run.i1 = i; run.peak = Math.max(run.peak, peak); }
+      else { run = { key, label, i0: i, i1: i, peak }; jitter.push(run); }
+      for (let k = Math.max(0, i - 1); k <= Math.min(n - 1, i + 1); k++) series[k] = NaN;
+    }
+  }
 
   /* --- 7. handy positional series ----------------------------------- */
   const Y = {
@@ -2338,18 +2365,23 @@ function renderJitter() {
   }
   const t0 = D.t[0];
   const worst = D.jitter.reduce((a, b) => (b.peak > a.peak ? b : a));
-  const spans = D.jitter
-    .map((j) => `${(D.t[j.i0] - t0).toFixed(2)}–${(D.t[j.i1] - t0).toFixed(2)}s`)
-    .join(', ');
-  const joints = [...new Set(D.jitter.map((j) => j.label))].join(', ');
+  // The windows overlap across joints; report the span they cover, not each one.
+  const from = Math.min(...D.jitter.map((j) => j.i0));
+  const to = Math.max(...D.jitter.map((j) => j.i1));
+  const dropped = D.jitter.reduce((sum, j) => sum + (j.i1 - j.i0 + 1), 0);
+  const joints = [...new Set(D.jitter.map((j) => j.label))];
+  const named = joints.length > 3
+    ? `${joints.slice(0, 3).join(', ')} and ${joints.length - 3} more`
+    : joints.join(', ');
   host.hidden = false;
   host.className = 'warnbar';
   host.innerHTML =
-    `<span>⚠</span><span><b>Too fast for the camera to freeze.</b> The ${esc(joints)} appears to move at ` +
-    `${Math.round(worst.peak).toLocaleString()}°/s at ${esc(spans)} — beyond what a human joint does, so the ` +
-    'limb is smeared across those frames rather than actually there. Those samples are dropped: the charts ' +
-    'break and any measurement needing them reads “—”. A faster shutter speed fixes it; more light lets the ' +
-    'camera choose one.</span>';
+    `<span>⚠</span><span><b>Too fast for the camera to freeze.</b> Between ` +
+    `${(D.t[from] - t0).toFixed(2)}s and ${(D.t[to] - t0).toFixed(2)}s the ${esc(named)} ` +
+    `appear${joints.length === 1 ? 's' : ''} to move at up to ` +
+    `${Math.round(worst.peak).toLocaleString()}°/s — faster than a human moves, so the limb is smeared ` +
+    `across those frames rather than actually there. ${dropped} sample${dropped === 1 ? '' : 's'} dropped; ` +
+    'anything needing them reads “—”. A faster shutter fixes it, and more light lets the camera pick one.</span>';
 }
 
 function buildTrailOptions() {

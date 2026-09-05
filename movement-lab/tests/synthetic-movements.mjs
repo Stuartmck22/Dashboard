@@ -407,5 +407,36 @@ console.log('\n--- motion-blur rejection (regression) ---');
   assert(kept >= 22, `clean samples elsewhere in the clip are untouched (${kept}/25)`);
 }
 
+/* ---- test 6b: the same check applied to whole-segment rotation ---- */
+{
+  // Rear-view smash: the shoulder line is only ~40 cm long, so mis-placing one
+  // shoulder for two frames swung its heading 125 deg and produced an apparent
+  // 3,744 deg/s trunk rotation. Elite trunk rotation peaks near 1,200.
+  const fps = 60, dur = 1.2, n = Math.round(dur*fps);
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    const t = i/fps;
+    const trunkDeg = -20 + 40*(1/(1+Math.exp(-(t-0.6)/0.06)));
+    frames.push(makePose({ hipY: 0.94, toeY: 0.02, trunkDeg, pelvisDeg: trunkDeg*0.6 }));
+  }
+  const raw = buildRaw(frames, fps);
+  for (const i of [38, 39]) {                       // swap the shoulders for two frames
+    for (let k = 0; k < 3; k++) {
+      const l = raw.world[i][LM.shoulderL*3+k], r = raw.world[i][LM.shoulderR*3+k];
+      raw.world[i][LM.shoulderL*3+k] = r; raw.world[i][LM.shoulderR*3+k] = l;
+      const ln = raw.normed[i][LM.shoulderL*3+k], rn = raw.normed[i][LM.shoulderR*3+k];
+      raw.normed[i][LM.shoulderL*3+k] = rn; raw.normed[i][LM.shoulderR*3+k] = ln;
+    }
+  }
+  const D = reconstruct(raw, { preset: 'smash', side: 'right', smoothing: 1, heightCm: 0 });
+  const seg = D.jitter.filter(j => j.label && j.label.includes('rotation'));
+  console.log('   segment-rotation windows flagged:', seg.map(j => `${j.label} ${j.peak.toFixed(0)}/s`).join(', ') || 'none');
+  assert(seg.length > 0, 'an impossible segment rotation rate is caught');
+  const finite = [...D.V.trunkRot].filter(Number.isFinite);
+  const mx = Math.max(...finite.map(Math.abs));
+  assert(mx <= 1400, `no trunk rotation above the ceiling survives (max ${mx.toFixed(0)} deg/s)`);
+  assert(finite.length > D.n * 0.7, 'the rest of the rotation trace is kept');
+}
+
 console.log(`\n${fails === 0 ? 'ALL TESTS PASSED' : fails + ' FAILURE(S)'}`);
 process.exit(fails ? 1 : 0);
