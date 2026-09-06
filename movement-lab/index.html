@@ -509,6 +509,7 @@ kbd {
       <h2>Export &amp; compare</h2>
       <div class="body stack">
         <div class="row">
+          <button class="primary" id="shotCardBtn">Shot card (PNG)</button>
           <button id="csvAnglesBtn">Angles + speeds CSV</button>
           <button id="csvLandmarksBtn">Raw landmarks CSV</button>
           <button id="csvSummaryBtn">Summary row CSV</button>
@@ -1453,7 +1454,7 @@ function analyseStrike(D, preset) {
     { key: 'shoulder_at_contact', label: 'Shoulder elevation at contact', value: valueAt(shoulderDom, contact), unit: '°', decimals: 0 },
     { key: 'peak_elbow_extension_velocity', label: 'Peak elbow extension speed', value: peakElbowExt, unit: '°/s', decimals: 0 },
     { key: 'max_separation', label: 'Max shoulder–hip separation', value: valueAt(absSep, peakSep), unit: '°', decimals: 0,
-      note: 'the "X-factor" — depth dependent, read as a trend' },
+      note: 'the "X-factor" — read as a trend' },
     { key: 'min_elbow', label: 'Deepest arm cock (min elbow)', value: valueAt(elbowDom, mostCocked), unit: '°', decimals: 0 },
     { key: 'min_knee', label: 'Deepest knee bend', value: valueAt(kneeDom, deepestKnee), unit: '°', decimals: 0 },
     { key: 'knee_rom_to_contact', label: 'Knee range into contact', value: romKnee, unit: '°', decimals: 0 },
@@ -2857,6 +2858,262 @@ $('jsonBtn').addEventListener('click', () => {
     },
   };
   downloadText(JSON.stringify(payload, null, 2), `${baseName()}_session.json`, 'application/json');
+});
+
+/* ============================ shot card =========================== *
+ * A single shareable image: the athlete at contact, the numbers that
+ * matter for the shot, the phase timeline, and — the part that keeps it
+ * honest — what the clip did not let us measure.
+ * ================================================================== */
+const CARD = {
+  w: 1080, pad: 48,
+  head: 128, hero: 820, headline: 170, tiles: 300, phases: 116, flags: 132, foot: 76,
+  ink: '#ffffff', dim: '#c3c2b7', mute: '#898781',
+  plane: '#0d0d0d', surface: '#1a1a19', line: 'rgba(255,255,255,0.10)',
+  accent: '#3987e5', warm: '#d95926', good: '#0ca30c', warn: '#fab219', bad: '#d03b3b',
+  sans: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+};
+
+/** Bounding box of the tracked body at frame i, in normalised coords. */
+function bodyBox(D, i, padFrac = 0.28) {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0, any = false;
+  for (let j = 0; j < N_LM; j++) {
+    if (!visible(D, i, j)) continue;
+    const x = D.draw[i][j * 2], y = D.draw[i][j * 2 + 1];
+    if (!isNum(x) || !isNum(y)) continue;
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+    y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    any = true;
+  }
+  if (!any) return { x: 0, y: 0, w: 1, h: 1 };
+  const px = (x1 - x0) * padFrac, py = (y1 - y0) * padFrac * 0.5;
+  return { x: x0 - px, y: y0 - py, w: (x1 - x0) + px * 2, h: (y1 - y0) + py * 2 };
+}
+
+/** Fit a normalised box to a target aspect, keeping it inside the frame. */
+function fitBox(box, aspect) {
+  let { x, y, w, h } = box;
+  if (w / h < aspect) { const nw = h * aspect; x -= (nw - w) / 2; w = nw; }
+  else { const nh = w / aspect; y -= (nh - h) / 2; h = nh; }
+  if (w > 1) { x = 0; w = 1; }
+  if (h > 1) { y = 0; h = 1; }
+  x = clamp(x, 0, 1 - w); y = clamp(y, 0, 1 - h);
+  return { x, y, w, h };
+}
+
+function cardText(g, text, x, y, { size = 28, weight = 400, color = CARD.ink, align = 'left', max = 0 } = {}) {
+  g.font = `${weight} ${size}px ${CARD.sans}`;
+  g.fillStyle = color;
+  g.textAlign = align;
+  g.textBaseline = 'alphabetic';
+  let t = String(text);
+  if (max) {
+    while (t.length > 1 && g.measureText(t).width > max) t = t.slice(0, -2) + '…';
+  }
+  g.fillText(t, x, y);
+  return g.measureText(t).width;
+}
+
+/** Draw text across up to `lines` lines, breaking on spaces. Returns lines used. */
+function cardWrap(g, text, x, y, width, { size = 20, weight = 400, color = CARD.ink, lines = 2, leading = 24 } = {}) {
+  g.font = `${weight} ${size}px ${CARD.sans}`;
+  g.fillStyle = color;
+  g.textAlign = 'left';
+  const words = String(text).split(' ');
+  const out = [];
+  let cur = '';
+  for (const w of words) {
+    const test = cur ? `${cur} ${w}` : w;
+    if (g.measureText(test).width > width && cur) { out.push(cur); cur = w; } else cur = test;
+    if (out.length === lines) break;
+  }
+  if (out.length < lines && cur) out.push(cur);
+  out.forEach((line, k) => {
+    let t = line;
+    if (k === lines - 1 && out.length === lines) {
+      const rest = words.join(' ');
+      if (g.measureText(rest).width > width * lines) {
+        while (t.length > 1 && g.measureText(t + '…').width > width) t = t.slice(0, -1);
+        if (t !== line) t += '…';
+      }
+    }
+    g.fillText(t, x, y + k * leading);
+  });
+  return out.length;
+}
+
+function cardChip(g, text, x, y, color) {
+  g.font = `600 21px ${CARD.sans}`;
+  const w = g.measureText(text).width + 30;
+  g.fillStyle = 'rgba(255,255,255,0.06)';
+  g.strokeStyle = color;
+  g.lineWidth = 1.5;
+  const r = 17;
+  g.beginPath(); g.roundRect(x, y, w, 34, r); g.fill(); g.stroke();
+  g.fillStyle = color;
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillText(text, x + 15, y + 18);
+  g.textBaseline = 'alphabetic';
+  return w;
+}
+
+async function buildShotCard() {
+  const D = state.D, R = state.R;
+  const primary = R.events.find((e) => e.primary) || R.events[0];
+  const idx = primary ? primary.i : state.idx;
+  await goToFrame(idx);
+
+  // The card states the angles properly below, and the motion trail runs off
+  // the crop — so the hero gets a plain skeleton.
+  const saved = { overlay: $('overlaySel').value, trail: $('trailSel').value,
+                  angles: $('showAngles').checked, dim: $('dimVideo').checked };
+  $('overlaySel').value = 'skeleton';
+  $('trailSel').value = '-1';
+  $('showAngles').checked = false;
+  $('dimVideo').checked = false;
+  drawFrame(idx);
+  await new Promise((r) => requestAnimationFrame(r));
+
+  const H = CARD.head + CARD.hero + CARD.headline + CARD.tiles + CARD.phases + CARD.flags + CARD.foot;
+  const card = document.createElement('canvas');
+  card.width = CARD.w; card.height = H;
+  const g = card.getContext('2d');
+  const P = CARD.pad;
+
+  g.fillStyle = CARD.plane; g.fillRect(0, 0, CARD.w, H);
+
+  /* ---- header ---- */
+  const preset = PRESETS[D.opts.preset] || PRESETS.generic;
+  cardText(g, D.opts.athlete || 'Athlete', P, 62, { size: 40, weight: 650 });
+  cardText(g, `${preset.label} · ${new Date().toLocaleDateString()}`, P, 98,
+    { size: 23, color: CARD.dim });
+  cardText(g, `${D.fps} fps`, CARD.w - P, 62, { size: 23, color: CARD.mute, align: 'right' });
+  cardText(g, `${Math.round(D.coverage * 100)}% tracked`, CARD.w - P, 98,
+    { size: 23, color: CARD.mute, align: 'right' });
+
+  /* ---- hero: the athlete at contact ---- */
+  const heroY = CARD.head;
+  const box = fitBox(bodyBox(D, idx, 0.42), CARD.w / CARD.hero);
+  g.save();
+  g.beginPath(); g.rect(0, heroY, CARD.w, CARD.hero); g.clip();
+  g.fillStyle = '#000'; g.fillRect(0, heroY, CARD.w, CARD.hero);
+  if (video.videoWidth) {
+    g.drawImage(video, box.x * video.videoWidth, box.y * video.videoHeight,
+                box.w * video.videoWidth, box.h * video.videoHeight, 0, heroY, CARD.w, CARD.hero);
+  }
+  if (canvas.width) {
+    g.drawImage(canvas, box.x * canvas.width, box.y * canvas.height,
+                box.w * canvas.width, box.h * canvas.height, 0, heroY, CARD.w, CARD.hero);
+  }
+  const grad = g.createLinearGradient(0, heroY + CARD.hero - 220, 0, heroY + CARD.hero);
+  grad.addColorStop(0, 'rgba(13,13,13,0)'); grad.addColorStop(1, CARD.plane);
+  g.fillStyle = grad; g.fillRect(0, heroY + CARD.hero - 220, CARD.w, 220);
+  g.restore();
+  $('overlaySel').value = saved.overlay; $('trailSel').value = saved.trail;
+  $('showAngles').checked = saved.angles; $('dimVideo').checked = saved.dim;
+
+  // Sits over the gradient, where nothing competes with it.
+  cardChip(g, `${(primary?.label || 'Key frame').toUpperCase()} · ${(D.t[idx] - D.t[0]).toFixed(3)}s`,
+    P, heroY + CARD.hero - 62, CARD.accent);
+
+  /* ---- headline: the shot's defining number, plus two supports ---- */
+  let y = heroY + CARD.hero;
+  const hero = R.metrics.find((m) => m.hero) || R.metrics[0];
+  const supports = R.metrics.filter((m) => m !== hero && m.key !== 'contact_time').slice(0, 2);
+  cardText(g, hero.label.toUpperCase(), P, y + 38, { size: 21, weight: 600, color: CARD.mute });
+  const bigVal = isNum(hero.value) ? fmt(hero.value, hero.decimals) : '—';
+  g.font = `650 84px ${CARD.sans}`;
+  const bw = g.measureText(bigVal).width;
+  cardText(g, bigVal, P, y + 118, { size: 84, weight: 650 });
+  cardText(g, hero.unit, P + bw + 14, y + 118, { size: 30, weight: 500, color: CARD.dim });
+  if (hero.note) cardText(g, hero.note, P, y + 152, { size: 22, color: CARD.mute, max: 340 });
+  supports.forEach((m, k) => {
+    const sx = CARD.w - P - (1 - k) * 310;
+    cardText(g, m.label, sx, y + 46, { size: 20, color: CARD.mute, align: 'right', max: 290 });
+    const v = isNum(m.value) ? fmt(m.value, m.decimals) : '—';
+    cardText(g, v, sx, y + 104, { size: 46, weight: 600, align: 'right' });
+    if (m.unit) cardText(g, m.unit, sx, y + 134, { size: 20, color: CARD.dim, align: 'right' });
+  });
+
+  /* ---- tiles: six more measurements, blanks included ---- */
+  y += CARD.headline;
+  const rest = R.metrics
+    .filter((m) => m !== hero && !supports.includes(m) && m.key !== 'contact_time')
+    .slice(0, 6);
+  const cw = (CARD.w - P * 2) / 3, ch = CARD.tiles / 2;
+  rest.forEach((m, k) => {
+    const cx = P + (k % 3) * cw, cy = y + Math.floor(k / 3) * ch;
+    g.strokeStyle = CARD.line; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(cx, cy + ch - 1); g.lineTo(cx + cw - 18, cy + ch - 1); g.stroke();
+    cardWrap(g, m.label, cx, cy + 34, cw - 26, { size: 20, color: CARD.mute, lines: 2, leading: 24 });
+    const has = isNum(m.value);
+    const v = has ? fmt(m.value, m.decimals) : '—';
+    g.font = `600 42px ${CARD.sans}`;
+    const vw = g.measureText(v).width;
+    cardText(g, v, cx, cy + 108, { size: 42, weight: 600, color: has ? CARD.ink : CARD.mute });
+    if (has && m.unit) cardText(g, m.unit, cx + vw + 8, cy + 108, { size: 21, color: CARD.dim });
+    cardText(g, has ? (m.note || '') : 'not measurable in this clip', cx, cy + 136,
+      { size: 19, color: CARD.mute, max: cw - 26 });
+  });
+
+  /* ---- phase timeline ---- */
+  y += CARD.tiles;
+  const t0 = D.t[0], span = (D.t[D.n - 1] - t0) || 1;
+  const barX = P, barW = CARD.w - P * 2, barY = y + 52, barH = 30;
+  cardText(g, 'PHASES', P, y + 32, { size: 20, weight: 600, color: CARD.mute });
+  g.fillStyle = 'rgba(255,255,255,0.06)';
+  g.beginPath(); g.roundRect(barX, barY, barW, barH, 6); g.fill();
+  (D.phases || []).forEach((ph, k) => {
+    const x0 = barX + ((D.t[ph.i0] - t0) / span) * barW;
+    const x1 = barX + ((D.t[ph.i1] - t0) / span) * barW;
+    g.fillStyle = k % 2 ? 'rgba(57,135,229,0.28)' : 'rgba(57,135,229,0.50)';
+    g.beginPath(); g.roundRect(x0 + 1, barY, Math.max(2, x1 - x0 - 2), barH, 6); g.fill();
+    if (x1 - x0 > 96) {
+      cardText(g, ph.label, (x0 + x1) / 2, barY + barH + 26,
+        { size: 19, color: CARD.dim, align: 'center', max: x1 - x0 });
+    }
+  });
+  const cx = barX + ((D.t[idx] - t0) / span) * barW;
+  g.strokeStyle = CARD.warm; g.lineWidth = 3;
+  g.beginPath(); g.moveTo(cx, barY - 8); g.lineTo(cx, barY + barH + 8); g.stroke();
+
+  /* ---- what this clip could not tell us ---- */
+  y += CARD.phases;
+  cardText(g, 'CONFIDENCE', P, y + 26, { size: 20, weight: 600, color: CARD.mute });
+  let chipX = P;
+  const chips = [];
+  const weak = Object.entries(D.keyCoverage || {}).filter(([, f]) => f < 0.9);
+  if (weak.length) chips.push([`${weak.length} joint${weak.length > 1 ? 's' : ''} partly hidden`, CARD.warn]);
+  if (D.jitter?.length) chips.push(['motion blur — samples dropped', CARD.warn]);
+  if (D.impossible?.length) chips.push(['out-of-range pose dropped', CARD.warn]);
+  if (R.candidates?.length) chips.push(['contact timing estimated', CARD.warn]);
+  if (R.pinned) chips.push(['contact set by coach', CARD.accent]);
+  if (D.fps < 120) chips.push([`${D.fps} fps — speeds under-read`, CARD.warn]);
+  if (!chips.length) chips.push(['clean capture', CARD.good]);
+  for (const [text, colour] of chips.slice(0, 4)) {
+    if (chipX + 320 > CARD.w - P) break;
+    chipX += cardChip(g, text, chipX, y + 44, colour) + 12;
+  }
+  cardText(g, 'Measured, not graded — target zones need calibrating against your own athletes.',
+    P, y + 116, { size: 20, color: CARD.mute });
+
+  /* ---- footer ---- */
+  y += CARD.flags;
+  g.strokeStyle = CARD.line; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(P, y + 6); g.lineTo(CARD.w - P, y + 6); g.stroke();
+  cardText(g, 'Movement Lab', P, y + 50, { size: 22, weight: 600, color: CARD.dim });
+  cardText(g, D.opts.fileName || '', CARD.w - P, y + 50,
+    { size: 20, color: CARD.mute, align: 'right', max: 520 });
+
+  return card;
+}
+
+$('shotCardBtn').addEventListener('click', async () => {
+  stopPlayback();
+  const at = state.idx;
+  const card = await buildShotCard();
+  card.toBlob((blob) => downloadBlob(blob, `${baseName()}_shotcard.png`), 'image/png');
+  goToFrame(at);
 });
 
 /* ----------------------------- reference -------------------------- */
